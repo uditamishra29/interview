@@ -1,139 +1,300 @@
+"""first finding deterministic suppression, de-duplication, grouping and routing."""
+
+import argparse
+import json
+from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import yaml
 
-def load_data(folder,run_date):
 
-    #  reading findings.json 
-    findings = pd.read_json(f"{folder}/findings.json", lines=True)
+# Read the files needed for Stage 1.
+def load_data(folder, run_date):
+    folder = Path(folder)
+    date.fromisoformat(run_date)  # Checking for  YYYY-MM-DD format.
+
+    findings = pd.read_json(folder / "findings.jsonl", lines=True)
+    findings = findings[findings["run_date"].astype(str) == run_date].copy()
+
+    instruments = pd.read_csv(folder / "instruments.csv", dtype=str)
+    holidays = pd.read_csv(folder / "exchange_holidays.csv", dtype=str)
+
+    with open(folder / "known_issues.yaml", encoding="utf-8") as file:
+        known_issues = yaml.safe_load(file) or []
+
+    with open(folder / "routing.yaml", encoding="utf-8") as file:
+        routing = yaml.safe_load(file) or {}
+
+    # Add the instrument's exchange so we can check holidays.
+    findings = findings.merge(
+        instruments[["symbol", "exchange"]],
+        left_on="instrument",
+        right_on="symbol",
+        how="left",
+        validate="many_to_one",
+    ).drop(columns="symbol")
+
+    # Keep tracking columns: do not delete findings.
+    findings["disposition"] = "pending"
+    findings["reason_code"] = None
+    findings["reason"] = None
+    findings["ticket"] = None
+    findings["duplicate_of"] = None
+    findings["group_id"] = None
+
+    return findings, holidays, known_issues, routing
 
 
-    findings=findings[findings[run_date]==run_date].copy()
+# Suppress stale-price and missing-row checks only when the correct exchange was closed.
 
+def find_holiday_suppression(findings, holidays, run_date):
 
-    # reading instruments.csv metadata 
-    instruments = pd.read_csv(f"{folder}/instruments.csv")
+    # Get exchanges closed on the run date
+    today_holidays = holidays[holidays["date"] == run_date]
 
-    # reading dev_labels.csv metadata 
-    dev_labels = pd.read_csv(f"{folder}/dev_labels.csv")
+    # Loop through each finding
+    for index, finding in findings.iterrows():
 
-    # reading exchange_holidays.csv metadata
-    exchange_holidays = pd.read_csv(f"{folder}/exchange_holidays.csv")
+        # Skip already processed findings
+        if finding["disposition"] != "pending":
+            continue
 
+        # Only suppress stale price and missing row
+        if finding["check_id"] not in ["DQ.STALE_PRICE", "DQ.MISSING_ROW"]:
+            continue
 
-    with open('known_issues.yaml', 'r', encoding='utf-8') as file:
-    # Safely load the YAML contents into a Python dictionary or list
-       known_issues = yaml.safe_load(file)
+        # Get exchange
+        exchange = finding["exchange"]
 
-    with open('routing.yaml', 'r', encoding='utf-8') as file:
-    # Safely load the YAML contents into a Python dictionary or list
-       routing = yaml.safe_load(file)
+        # Find holiday record for this exchange
+        holiday_match = today_holidays[today_holidays["exchange"] == exchange]
 
-    return findings, instruments, dev_labels,exchange_holidays, known_issues, routing
+        # If exchange is closed, suppress the finding
+        if not holiday_match.empty:
 
+            # Get holiday name from matching row
+            holiday_name = holiday_match.iloc[0]["name"]
 
+            findings.at[index, "disposition"] = "suppressed"
+            findings.at[index, "reason_code"] = "exchange_holiday"
+            findings.at[index, "reason"] = (
+                f"{exchange} was closed on {run_date}: {holiday_name}"
+            )
+
+    return findings
 
 
 # - id: KI-01
 #   match: {check_id: DQ.PRICE_JUMP, instrument: XT}
-#   reason: "XT settlements are yield-quoted; price-jump threshold not yet adapted to yield-transformed series"
+#   reason: "XT settlements are yield-quoted"
 #   ticket: DATA-412
 #   expires: 2025-12-31
-# - id: KI-02
-#   match: {check_id: PT.WEIGHT_SUM}
-#   reason: "Weight-sum tolerance too tight for float rounding"
-#   ticket: PORT-88
-#   expires: 2025-11-01
-# - id: KI-03
-#   match: {check_id: DQ.STALE_PRICE, instrument: IR}
-#   reason: "IR settlement feed only updates on RBA-relevant days; under review"
-#   ticket: DATA-430
-#   expires: 2026-01-31
+
+# Suppress only if the rule is active and every match field is equal.
 
 
+def get_known_issues(findings, known_issues, run_date):
 
-def get_known_issues(findings, known_issues,run_date):
-    
-    # check for each known issue in the findings
+    # Loop through each known issue
     for issue in known_issues:
-        if issue['expires'] < run_date:
-            continue  # Skip expired issues
 
-        # check on check_id and instrument if specified
-        matches= all(
-            findings.get(key)==value
-        for key, value in issue['match'].items())
- 
-        if matches:
-            print(f"Found known issue: {issue['id']}")
-            # removing this finding from the findings DataFrame
-            findings.drop(findings[(findings[list(issue['match'].keys())[0]] == list(issue['match'].values())[0])].index, inplace=True)
-            
+        # Check expiry date
+        expires = pd.to_datetime(issue["expires"]).date()
+        if expires < pd.to_datetime(run_date).date():
+            continue
 
+        # Get matching conditions from YAML
+        match = issue["match"]
 
-    return None  # Return None if no known issues are found
+        # Check pending findings with matching check_id
+        matching = (
+            (findings["disposition"] == "pending") &
+            (findings["check_id"] == match["check_id"])
+        )
 
+        # Check instrument only if specified in YAML
+        if "instrument" in match:
+            matching = matching & (findings["instrument"] == match["instrument"])
 
+        # Suppress matching findings
+        findings.loc[matching, "disposition"] = "suppressed"
+        findings.loc[matching, "reason_code"] = f"known_issue:{issue['id']}"
+        findings.loc[matching, "reason"] = issue["reason"]
+        findings.loc[matching, "ticket"] = issue.get("ticket")
 
-# exchange_holiday data 
+    return findings
 
-# exchange	date	name
-# CME	2025-11-27	Thanksgiving Day
-# CME	2025-12-25	Christmas Day
-# ICE-US	2025-11-27	Thanksgiving Day
-# ICE-US	2025-12-25	Christmas Day
-# ICE-EU	2025-12-25	Christmas Day
-# ICE-EU	2025-12-26	Boxing Day
-# EUREX	2025-12-24	Christmas Eve
-# EUREX	2025-12-25	Christmas Day
-# EUREX	2025-12-26	Boxing Day
-# JPX	2025-11-03	Culture Day
-# JPX	2025-11-24	Labour Thanksgiving Day (observed)
-# JPX	2025-12-31	Year-end holiday
-# ASX	2025-12-25	Christmas Day
-# ASX	2025-12-26	Boxing Day
-
-
-# instruments.csv data
-# symbol	exchange	asset_class	description
-# ES	CME	equity_index	E-mini S&P 500
-# NQ	CME	equity_index	E-mini Nasdaq-100
-# ZN	CME	rates	10-Year US Treasury Note
-# CL	CME	energy	WTI Crude Oil
-# GC	CME	metals	Gold
-# 6E	CME	fx	Euro FX
-# FGBL	EUREX	rates	Euro-Bund
-# FESX	EUREX	equity_index	Euro STOXX 50
-# BRN	ICE-EU	energy	Brent Crude
-# JGB	JPX	rates	10-Year JGB
-# NK	JPX	equity_index	Nikkei 225
-# YAP	ASX	equity_index	SPI 200
-# XT	ASX	rates	10-Year Australian Treasury Bond
-# IR	ASX	rates	90-Day Bank Bill
-
-
-def find_holiday_suppression(findings, exchange_holidays, run_date):
-    # Filter exchange_holidays for the run_date
-    holidays_today = exchange_holidays[exchange_holidays['date'] == run_date]       #run_date is cuurent date
-
-    # Check if any findings match the exchanges that have holidays today
-    suppressed_findings = findings[findings['exchange'].isin(holidays_today['exchange'])]
-
-    if not suppressed_findings.empty:
-        print(f"Suppressed findings due to holidays on {run_date}:")
-        print(suppressed_findings)
-    else:
-        print(f"No suppressed findings due to holidays on {run_date}.")
-
-    return suppressed_findings
-
-
-#De-duplication: collapse findings that are the same observation emitted more than once.
-
+# Mark repeated observations, even if the check was run with a different run_id.
 def deduplicate_findings(findings):
-    # Drop duplicates based on 'run_date', 'check_id', 'instrument', and 'exchange'
-    deduplicated_findings = findings.drop_duplicates(subset=['run_date', 'check_id', 'instrument', 'exchange', 'upstream_job'], keep='first')
+    columns = [
+        "run_date", "check_id", "instrument", "raw_severity",
+        "value", "threshold", "message", "upstream_job",
+    ]
+    first_seen = {}
 
-    return deduplicated_findings
+    for index, row in findings[findings["disposition"] == "pending"].iterrows():
+        key = tuple(None if pd.isna(row[col]) else str(row[col]) for col in columns)
 
-    
+        if key in first_seen:
+            findings.at[index, "disposition"] = "duplicate"
+            findings.at[index, "duplicate_of"] = first_seen[key]
+            findings.at[index, "reason_code"] = "duplicate_observation"
+            findings.at[index, "reason"] = f"Same observation as {first_seen[key]}"
+        else:
+            first_seen[key] = row["id"]
+
+    return findings
+
+
+# Calculate the owning team using the longest matching check_id prefix.
+def get_route(check_id, routing):
+
+    # Get routing rules from YAML
+    routes = routing.get("routes", {})
+
+    # Get default team
+    team = routing.get("default", "triage-human")
+
+    # Store the longest matching prefix
+    longest_prefix = ""
+
+    # Loop through each prefix and team
+    for prefix, owner in routes.items():
+
+        # Check if check_id starts with this prefix
+        if check_id.startswith(prefix):
+
+            # Select the longest matching prefix
+            if len(prefix) > len(longest_prefix):
+
+                longest_prefix = prefix
+                team = owner
+
+    return team
+
+
+# Group failed ingest jobs with their missing-row findings; keep other checks separate.
+
+def group_findings(findings, routing):
+
+    #  Find all failed ingest jobs
+    active = findings[findings["disposition"] == "pending"]
+
+    failed = active[active["check_id"] == "INGEST.JOB_FAILED"]
+    failed_jobs = failed["upstream_job"].dropna().tolist()
+
+    #  Group findings with the same root cause
+    group_members = {}
+
+    for index, row in findings.iterrows():
+
+        # Find the owning team
+        findings.at[index, "route_to"] = get_route(row["check_id"], routing)
+
+        # Skip suppressed and duplicate findings
+        if row["disposition"] != "pending":
+            continue
+
+        job = row["upstream_job"]
+
+        # Group missing rows with their failed ingest job
+        if pd.notna(job) and job in failed_jobs and row["check_id"] in ["INGEST.JOB_FAILED", "DQ.MISSING_ROW"]:
+            root_cause = "ingest_failure:" + job
+        else:
+            root_cause = "finding:" + row["id"]
+
+        # Create new group if it does not exist
+        if root_cause not in group_members:
+            group_members[root_cause] = []
+
+        # Add finding index to its group
+        group_members[root_cause].append(index)
+
+    # Create issue groups
+    groups = []
+
+    for root_cause, indices in group_members.items():
+
+        group_id = "G" + str(len(groups) + 1)
+
+        # Update findings with group ID
+        findings.loc[indices, "disposition"] = "issue"
+        findings.loc[indices, "group_id"] = group_id
+
+        # Get all findings in this group
+        members = findings.loc[indices]
+
+        # Get owning teams
+        owners = members["route_to"].unique().tolist()
+
+        if len(owners) == 1:
+            owner = owners[0]
+        else:
+            owner = routing.get("default", "triage-human")
+
+        # Get highest severity (P0 is highest)
+        severity = min(members["raw_severity"])
+
+        # Store group information
+        groups.append({
+            "group_id": group_id,
+            "root_cause_key": root_cause,
+            "finding_ids": members["id"].tolist(),
+            "check_ids": members["check_id"].tolist(),
+            "raw_severity": severity,
+            "route_to": owner,
+            "routing_conflict": len(owners) > 1
+        })
+
+    #  Linkingduplicates to original group's ID
+    duplicates = findings[findings["disposition"] == "duplicate"]
+
+    for index, row in duplicates.iterrows():
+
+        original = findings[findings["id"] == row["duplicate_of"]]
+
+        if not original.empty:
+            findings.at[index, "group_id"] = original.iloc[0]["group_id"]
+
+    return findings, groups
+
+
+
+# Write an audit file for Stage 1; LLM fields are intentionally not included.
+def save_stage1(findings, groups, output_path, run_date):
+    result = {
+        "run_date": run_date,
+        "stage": "deterministic_only",
+        "findings": json.loads(findings.to_json(orient="records")),
+        "groups": groups,
+    }
+    Path(output_path).write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+
+# Connect all Stage 1 functions through a command-line program.
+def main():
+    parser = argparse.ArgumentParser(description="Data-quality triage: Stage 1")
+    parser.add_argument("--date", required=True, help="Run date, e.g. 2025-11-27")
+    parser.add_argument("--folder", default="T002-data", help="Folder containing inputs")
+    parser.add_argument("--output", default="stage1_output.json", help="Stage 1 JSON output")
+    args = parser.parse_args()
+
+    findings, holidays, known_issues, routing = load_data(args.folder, args.date)
+    findings = find_holiday_suppression(findings, holidays, args.date)
+    findings = get_known_issues(findings, known_issues, args.date)
+    findings = deduplicate_findings(findings)
+    findings, groups = group_findings(findings, routing)
+    save_stage1(findings, groups, args.output, args.date)
+
+    print(f"Findings: {len(findings)}")
+    print(f"Suppressed: {(findings['disposition'] == 'suppressed').sum()}")
+    print(f"Duplicates: {(findings['disposition'] == 'duplicate').sum()}")
+    print(f"Issue groups: {len(groups)}")
+    for group in groups:
+        print(f"{group['group_id']}: {group['finding_ids']} -> {group['route_to']}")
+    print(f"Saved output to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
